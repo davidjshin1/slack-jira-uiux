@@ -466,7 +466,7 @@ def process_reaction_worker(channel_id: str, message_ts: str, user_id: str):
         log("WORKER", "Verified storage")
         
         # 7. NOW send DM (ticket is definitely stored)
-        client.chat_postMessage(
+        dm_response = client.chat_postMessage(
             channel=user_id,
             text=f"New ticket draft: {ticket['title']}",
             blocks=[
@@ -503,7 +503,25 @@ def process_reaction_worker(channel_id: str, message_ts: str, user_id: str):
                 }
             ]
         )
-        log("WORKER", "Sent DM")
+        
+        # Store DM info so we can update it later
+        dm_channel = dm_response["channel"]
+        dm_ts = dm_response["ts"]
+        
+        # Update stored ticket with DM info
+        store_ticket(ticket_id, {
+            "ticket": ticket,
+            "slack_link": slack_link,
+            "channel_id": channel_id,
+            "message_ts": message_ts,
+            "files": files,
+            "user_id": user_id,
+            "created_at": time.time(),
+            "dm_channel": dm_channel,
+            "dm_ts": dm_ts
+        })
+        
+        log("WORKER", "Sent DM", dm_ts=dm_ts)
         
         # 8. Update reactions
         remove_reaction(token, channel_id, message_ts, "hourglass_flowing_sand")
@@ -533,6 +551,9 @@ def create_ticket_worker(user_id: str, ticket_data: dict, ticket: dict, project_
     log("CREATE", "Starting ticket creation")
     
     try:
+        from slack_sdk import WebClient
+        client = WebClient(token=token)
+        
         # 1. Create Jira ticket
         key, url = create_jira_ticket(ticket, ticket_data["slack_link"], project_key, epic_link)
         
@@ -541,17 +562,76 @@ def create_ticket_worker(user_id: str, ticket_data: dict, ticket: dict, project_
         uploaded, failed = [], []
         
         if files:
-            send_dm(token, user_id, f"✅ *{key}* created! Uploading {len(files)} file(s)...")
+            # Update draft to show uploading status
+            dm_channel = ticket_data.get("dm_channel")
+            dm_ts = ticket_data.get("dm_ts")
+            if dm_channel and dm_ts:
+                try:
+                    client.chat_update(
+                        channel=dm_channel,
+                        ts=dm_ts,
+                        text=f"Uploading files to {key}...",
+                        blocks=[
+                            {
+                                "type": "section",
+                                "text": {"type": "mrkdwn", "text": f"*✅ {key} Created!*\n\n*{ticket['title']}*"}
+                            },
+                            {
+                                "type": "context",
+                                "elements": [{"type": "mrkdwn", "text": f"📎 Uploading {len(files)} file(s)..."}]
+                            }
+                        ]
+                    )
+                except:
+                    pass
             uploaded, failed = attach_files_to_jira(key, files, token)
         
-        # 3. Final message
-        msg = f"✅ *Ticket Created:* <{url}|{key}>"
+        # 3. Build completion message
+        attachment_text = ""
         if uploaded:
-            msg += f"\n📎 *Attached:* {', '.join(uploaded)}"
+            attachment_text = f"\n📎 *Attached:* {', '.join(uploaded)}"
         if failed:
-            msg += f"\n⚠️ *Failed to attach:* {', '.join(failed)}"
+            attachment_text += f"\n⚠️ *Failed to attach:* {', '.join(failed)}"
         
-        send_dm(token, user_id, msg)
+        # 4. Update the original draft message to show completed state
+        dm_channel = ticket_data.get("dm_channel")
+        dm_ts = ticket_data.get("dm_ts")
+        
+        if dm_channel and dm_ts:
+            try:
+                client.chat_update(
+                    channel=dm_channel,
+                    ts=dm_ts,
+                    text=f"Ticket Created: {key}",
+                    blocks=[
+                        {
+                            "type": "section",
+                            "text": {"type": "mrkdwn", "text": f"*✅ Ticket Created*\n\n*<{url}|{key}>*: {ticket['title']}"}
+                        },
+                        {
+                            "type": "section",
+                            "fields": [
+                                {"type": "mrkdwn", "text": f"*Type:* {ticket['issue_type']}"},
+                                {"type": "mrkdwn", "text": f"*Priority:* {ticket['priority']}"},
+                                {"type": "mrkdwn", "text": f"*Project:* {project_key}"},
+                                {"type": "mrkdwn", "text": f"*Epic:* {epic_link or 'None'}"}
+                            ]
+                        },
+                        {
+                            "type": "context",
+                            "elements": [{"type": "mrkdwn", "text": f"📎 {len(uploaded)} file(s) attached" if uploaded else "No attachments"}]
+                        }
+                    ]
+                )
+                log("CREATE", "Updated draft message to completed state")
+            except Exception as e:
+                log("CREATE", f"Failed to update draft message: {e}")
+                # Still send success message as fallback
+                send_dm(token, user_id, f"✅ *Ticket Created:* <{url}|{key}>{attachment_text}")
+        else:
+            # Fallback: send new message if we don't have DM info
+            send_dm(token, user_id, f"✅ *Ticket Created:* <{url}|{key}>{attachment_text}")
+        
         log("CREATE", "Done!", key=key, uploaded=len(uploaded), failed=len(failed))
         
     except Exception as e:
@@ -626,13 +706,24 @@ def handle_cancel(ack, body, client):
     ack()
     
     ticket_id = body["actions"][0]["value"]
+    data = get_ticket(ticket_id)
     delete_ticket(ticket_id)
     
+    # Update the message to show cancelled state (no buttons)
     client.chat_update(
         channel=body["channel"]["id"],
         ts=body["message"]["ts"],
-        text="🚫 Ticket cancelled",
-        blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": "🚫 *Ticket Cancelled*"}}]
+        text="🚫 Ticket Cancelled",
+        blocks=[
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": f"*🚫 Ticket Cancelled*\n\n~{data['ticket']['title'] if data else 'Draft'}~"}
+            },
+            {
+                "type": "context",
+                "elements": [{"type": "mrkdwn", "text": "React with 🎫 again to create a new draft"}]
+            }
+        ]
     )
     log("CANCEL", "Ticket cancelled", ticket_id=ticket_id)
 
@@ -671,8 +762,36 @@ def handle_modal_submit(ack, body, client, logger):
     epic_input = values["epic"]["epic_input"]
     epic_link = epic_input.get("value", "").strip() if epic_input else None
     
-    # Notify user
-    client.chat_postMessage(channel=user_id, text="⏳ Creating ticket...")
+    # Notify user we're working by updating the draft message temporarily
+    dm_channel = data.get("dm_channel")
+    dm_ts = data.get("dm_ts")
+    
+    if dm_channel and dm_ts:
+        try:
+            client.chat_update(
+                channel=dm_channel,
+                ts=dm_ts,
+                text=f"Creating ticket: {ticket['title']}",
+                blocks=[
+                    {
+                        "type": "section",
+                        "text": {"type": "mrkdwn", "text": f"*⏳ Creating Ticket...*\n\n*{ticket['title']}*"}
+                    },
+                    {
+                        "type": "section",
+                        "fields": [
+                            {"type": "mrkdwn", "text": f"*Type:* {ticket['issue_type']}"},
+                            {"type": "mrkdwn", "text": f"*Priority:* {ticket['priority']}"}
+                        ]
+                    },
+                    {
+                        "type": "context",
+                        "elements": [{"type": "mrkdwn", "text": "Please wait..."}]
+                    }
+                ]
+            )
+        except:
+            pass
     
     # Create in background
     thread = threading.Thread(
