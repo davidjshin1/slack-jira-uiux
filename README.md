@@ -14,7 +14,7 @@ React with :uiux: → Ticket created immediately. No confirmation modal.
 ## Flow
 
 ```
-1. Someone reacts with 🎫 to any message
+1. Someone reacts with :uiux: to any message
 2. Bot adds ⏳ reaction
 3. You get a DM showing progress:
    - "Analyzing conversation..."
