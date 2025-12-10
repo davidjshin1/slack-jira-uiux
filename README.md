@@ -1,6 +1,6 @@
 # Slack-to-Jira Bot (Auto-Create)
 
-React with 🎫 → Ticket created immediately. No confirmation modal.
+React with :uiux: → Ticket created immediately. No confirmation modal.
 
 ## Fixed Values
 
